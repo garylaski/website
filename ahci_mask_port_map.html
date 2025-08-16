@@ -1,0 +1,109 @@
+<table style="margin:auto;padding:5vh;max-width:50vw;font-size:1.1rem">
+<tr><td><h3>Saving 8 seconds of Linux boot time by setting ahci.mask_port_map
+<tr><td><h4>【2025-08-11】→ Gary Laski</h4>
+<p>ATA ports cost precious boot time due to being probed by <code>libATA</code>.
+The probing process takes around 1 second (empirically) per port, which in my case, resulted in 8 seconds of boot time wasted.</p>
+<p>I stumbled upon this while writing a script to determine the longest steps in boot as reported by <code>dmesg</code> logs. Six of the top ten longest
+steps were due to these <code>SATA link down</code> messages:
+<pre>
+$ ./main
+...
+Time waste 1.0398389999999997:
+	[    3.429959] ata2: SATA link down (SStatus 0 SControl 0)
+	[    4.469798] ata3: failed to resume link (SControl 0)
+Time waste 1.039834:
+	[    5.509962] ata4: SATA link down (SStatus 0 SControl 0)
+	[    6.549796] ata5: failed to resume link (SControl 0)
+Time waste 1.0398329999999998:
+	[    8.629970] ata7: SATA link down (SStatus 0 SControl 0)
+	[    9.669803] ata8: failed to resume link (SControl 0)
+Time waste 1.0398300000000003:
+	[    6.549974] ata5: SATA link down (SStatus 0 SControl 0)
+	[    7.589804] ata6: failed to resume link (SControl 0)
+Time waste 1.0398080000000007:
+	[    7.589983] ata6: SATA link down (SStatus 0 SControl 0)
+	[    8.629791] ata7: failed to resume link (SControl 0)
+Time waste 1.0398070000000001:
+	[    2.389970] ata1: SATA link down (SStatus 0 SControl 0)
+	[    3.429777] ata2: failed to resume link (SControl 0)
+</pre>
+<p>SATA ports are initialized by <code>libATA</code> and the module <code>ahci</code>, and the probing of all 8 ports takes around 8 seconds.
+<pre>
+$ dmesg | less
+[    1.339435] libata version 3.00 loaded.
+[    1.347914] ahci 0000:02:00.1: version 3.0
+[    1.348046] ahci 0000:02:00.1: SSS flag set, parallel bus scan disabled
+[    1.348351] ahci 0000:02:00.1: AHCI vers 0001.0301, 32 command slots, 6 Gbps, SATA mode
+[    1.348531] ahci 0000:02:00.1: 8/8 ports implemented (port mask 0xff)
+[    1.348687] ahci 0000:02:00.1: flags: 64bit ncq sntf stag pm led clo only pmp pio slum part sxs deso sadm sds apst 
+[    1.352143] scsi host0: ahci
+-- repeats --
+[    1.354126] scsi host7: ahci
+[    1.354316] ata1: SATA max UDMA/133 abar m131072@0xfce80000 port 0xfce80100 irq 64 lpm-pol 4
+-- repeats --
+[    1.355252] ata8: SATA max UDMA/133 abar m131072@0xfce80000 port 0xfce80480 irq 64 lpm-pol 4
+...
+[    2.389787] ata1: failed to resume link (SControl 0)
+[    2.389970] ata1: SATA link down (SStatus 0 SControl 0)
+-- repeats --
+[    9.669803] ata8: failed to resume link (SControl 0)
+[    9.669983] ata8: SATA link down (SStatus 0 SControl 0)
+...
+[   21.964553]
+</pre>
+<p>The <code>modinfo</code> for <code>ahci</code> gives a kernel parameter that masks controller ports, which can disable this probing behavior:
+<pre>
+$ modinfo ahci | less
+...
+parm:          mask_port_map:32-bits port map masks to ignore controllers ports. 
+               Valid values are: &quot;&lt;mask&gt;&quot; to apply the same mask to all AHCI controller devices, 
+               and &quot;&lt;pci_dev&gt;=&lt;mask&gt;,&lt;pci_dev&gt;=&lt;mask&gt;,...&quot; to specify different masks for the controllers specified, 
+               where &lt;pci_dev&gt; is the PCI ID of an AHCI controller in the form &quot;domain:bus:dev.func&quot; (charp)
+</pre>
+Since I am not using any of these ports, I tried setting the mask value to all 0's:
+<pre>
+ahci.mask_port_map=0
+</pre>
+Unfortunately, this did not work. There's a catch - the mask value of 0 is reserved for disabling the mask, which I found documented in the kernel source.
+I'm not sure why this cases exists - there's already a vaule that conveys this information - <code>0xFFFFFFFF</code> - which is the inital value as shown in the earlier log:
+<pre> 8/8 ports implemented (port mask 0xff)</pre>
+There's likely a valid reason for this behavior known to the <code>ahci</code> developers, but it's worth commenting on. For those curious, here's the function in question:
+
+<p><code>drivers/ata/ahci.h</code>:
+<pre>
+/*
+ * Return true if a port should be ignored because it is excluded from
+ * the host port map.
+ */
+static inline bool ahci_ignore_port(struct ahci_host_priv *hpriv,
+				    unsigned int portid)
+{
+	if (portid >= hpriv->nports)
+		return true;
+	/* mask_port_map not set means that all ports are available */
+	if (!hpriv->mask_port_map)
+		return false;
+	return !(hpriv->mask_port_map & (1 << portid));
+}
+</pre>
+Ultimately, I ended up setting 1 bit higher than any of the ports I need (9th bit): <code>ahci.mask_port_map=0x100</code>.
+This disables the ports, skipping the 8 second probing step, and reducing boot time from 21 to 13 seconds.
+<pre>
+$ dmesg | less
+...
+[    1.344934] libata version 3.00 loaded.
+[    1.349827] ahci 0000:02:00.1: version 3.0
+[    1.349883] ahci 0000:02:00.1: masking port_map 0xff -> 0x0
+[    1.350121] ahci 0000:02:00.1: SSS flag set, parallel bus scan disabled
+[    1.350320] ahci 0000:02:00.1: AHCI vers 0001.0301, 32 command slots, 6 Gbps, SATA mode
+[    1.350526] ahci 0000:02:00.1: 0/8 ports implemented (port mask 0x0)
+[    1.350673] ahci 0000:02:00.1: flags: 64bit ncq sntf stag pm led clo only pmp pio slum part sxs deso sadm sds apst 
+[    1.351795] scsi host0: ahci
+-- repeats --
+[    1.354037] scsi host7: ahci
+[    1.354228] ata1: DUMMY
+-- repeats --
+[    1.355077] ata8: DUMMY
+...
+[   13.577978]
+</pre>
